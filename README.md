@@ -32,7 +32,7 @@ mipt-ded-optics/build/ $ ./ln/lenses . # запускает программу, 
 
 Выглядеть программа будет примерно так:
 
-<img src="img/welcome.png">
+<img src="img/hello.png">
 
 ## Краткий обзор фич
 
