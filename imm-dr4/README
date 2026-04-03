@@ -1,0 +1,25 @@
+    isd.imm-dr4
+------------------------------------------------------------
+
+What?
+
+    This is a thing to draw using DR4 like a normal
+    drawing library. Without long-living objects.
+
+How?
+
+    We have a single static object for each type.
+
+What if window closes? How objects are allocated?
+
+    We also have WinRef, which is added as a field
+    to each object which lives inside the window.
+    (like widgets). When first WinRef for given 
+    window is created, objects are allocated.
+    When last is destroyed, objects are destroyed.
+
+What is contained withn plugin?
+
+    Plugin has only one purpose -- make so that instance
+    is one for all the program. Singleton, as someone
+    would say.

@@ -1,0 +1,104 @@
+#ifndef I_MLS2_RTR_SG_VIEW
+#define I_MLS2_RTR_SG_VIEW
+
+#include "dr4/texture.hpp"
+#include "hui/event.hpp"
+#include "hui/ui.hpp"
+#include "math/ray3f.h"
+#include "math/vec3f.h"
+#include "rtr/renderer.h"
+#include "sgui/widget.hpp"
+#include <pthread.h>
+#include <semaphore.h>
+#include <atomic>
+
+namespace sgui {
+
+class RTRView : public Widget {
+
+    friend void* rendererThreadEntry(void *arg);
+
+    struct RenderingParams {
+        vec3f cameraTarget = vec3f(0);
+        // relative to target
+        float cameraAzimuth = 0, cameraElevation = 0, cameraDistance = 10;   
+        float cameraPlaneDistance = 2;
+    };
+
+    rtr::Scene *m_scene;
+    RenderingParams m_pushedParams, m_activeParams;
+
+    struct RenderingThread {
+        RTRView *self;
+        size_t threadIndex;
+        size_t minIndex, maxIndex;
+        pthread_t thread;
+        uint64_t pixelsRendered;
+        std::atomic<uint64_t> rerenderRequestedAt;
+        sem_t wakeupSem;
+        bool isIdling;
+    };
+
+    std::vector<rgbf> m_framebuffer;
+    std::vector<size_t> m_indices;
+    RenderingThread *m_threads = nullptr; // because vector cannot have atomics
+    size_t m_curThreadCount = 0;
+    size_t m_tgtThreadCount = 1;
+
+    size_t m_fbWidth, m_fbHeight;
+    bool m_threadsShouldDie = false;
+    bool m_threadsIdling = false;
+
+    enum class MouseAction {
+        NONE, ROTATE, MOVE
+    };
+
+    MouseAction m_mouseAction;
+    vec3f m_mouseInitialVec;
+    vec3f m_mouseStartPos;
+    std::unique_ptr<dr4::Image> targetImage;
+
+    void rendererThread(RenderingThread &thread);
+
+    // Resize framebuffer, reset threads
+    void reset();
+
+    void requestRerender();
+    
+    ray3f rayForPixel(vec3f pos);
+
+public:
+
+    RTRView(hui::UI *app, rtr::Scene *scene);
+
+    inline void setCamAzimuth(float azimuth) { m_pushedParams.cameraAzimuth = azimuth; }
+    inline void setCamElevation(float elevation) { m_pushedParams.cameraElevation = elevation; }
+    inline void setCamDistance(float distance) { m_pushedParams.cameraDistance = distance; }
+    inline void setCamPlaneDistance(float distance) { m_pushedParams.cameraPlaneDistance = distance; }
+    inline void setCamTarget(vec3f target) { m_pushedParams.cameraTarget = target; }
+    void pushParams(); // Push changes done to parameters to renderer
+
+    inline float camAzimuth() { return m_pushedParams.cameraAzimuth; } 
+    inline float camElevation() { return m_pushedParams.cameraElevation; } 
+    inline float camDistance() { return m_pushedParams.cameraDistance; }
+    inline float camPlaneDistance() { return m_pushedParams.cameraPlaneDistance; }
+    inline vec3f camTarget() { return m_pushedParams.cameraTarget; }
+
+    /// Set number of threads. Will restart the threads immidiately.
+    inline void setThreadCount(size_t threads) { m_tgtThreadCount = threads; reset(); }
+
+    virtual void OnSizeChanged() override;
+    virtual void Redraw() const override;
+    virtual hui::EventResult OnIdle(hui::IdleEvent &evt) override;
+
+    virtual hui::EventResult OnMouseDown(hui::MouseButtonEvent &evt) override;
+    virtual hui::EventResult OnMouseMove(hui::MouseMoveEvent &evt) override;
+    virtual hui::EventResult OnMouseUp(hui::MouseButtonEvent &evt) override;
+    virtual hui::EventResult OnMouseWheel(hui::MouseWheelEvent &evt) override;
+
+    virtual ~RTRView();
+};
+
+}
+
+#endif

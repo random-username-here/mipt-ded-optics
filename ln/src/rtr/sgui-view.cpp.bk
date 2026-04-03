@@ -1,0 +1,304 @@
+#include "rtr/sgui-view.h"
+#include "dr4/mouse_buttons.hpp"
+#include "hui/event.hpp"
+#include "math/ray3f.h"
+#include "math/vec3f.h"
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <pthread.h>
+#include <semaphore.h>
+#include <unistd.h>
+#include <cassert>
+
+namespace sgui {
+
+RTRView::RTRView(hui::UI *app, rtr::Scene *scene) :Widget(app), m_scene(scene) {
+    assert(scene);
+    m_curThreadCount = 0;
+
+    scene->onObjectAdded.addListener([this](auto _){
+        requestRerender();
+    });
+    scene->onObjectDeleted.addListener([this](auto _){
+        requestRerender();
+    });
+    scene->onObjectFieldsChange.addListener([this](auto _){
+        requestRerender();
+    });
+    scene->onSelectionChange.addListener([this](){
+        requestRerender();
+    });
+
+    targetImage = std::unique_ptr<dr4::Image>(app->GetWindow()->CreateImage());
+}
+
+void* rendererThreadEntry(void *arg) {
+    assert(arg);
+    auto *threadInfo = static_cast<RTRView::RenderingThread*>(arg);
+    threadInfo->self->rendererThread(*threadInfo);
+    return NULL; 
+}
+
+void RTRView::reset() {
+
+    // --- Kill active threads
+    
+    m_threadsShouldDie = true;
+    for (size_t i = 0; i < m_curThreadCount; ++i) {
+        RenderingThread &thread = m_threads[i];
+        if (thread.isIdling)
+            sem_post(&thread.wakeupSem);
+        pthread_join(thread.thread, NULL);
+    }
+    delete [] m_threads;
+    m_threads = nullptr;
+    m_curThreadCount = 0;
+
+    m_threadsShouldDie = false;
+
+    // --- Resize framebuffer
+
+    m_fbWidth = (size_t) GetSize().x;
+    m_fbHeight = (size_t) GetSize().y;
+    size_t bufSize = m_fbWidth * m_fbHeight;
+    if (m_framebuffer.size() == bufSize)
+        goto noResizeNeeded;
+
+    // Resize it
+    targetImage->SetSize(GetSize());
+    m_framebuffer.resize(bufSize);
+
+    // Resize indices
+    m_indices.resize(bufSize);
+    for (size_t i = 0; i < bufSize; ++i)
+        m_indices[i] = i;
+    std::random_shuffle(m_indices.begin(), m_indices.end());
+
+noResizeNeeded:
+
+    // --- Start threads
+
+    if (m_tgtThreadCount == 0)
+        return;
+
+    size_t prevIndex = 0;
+    m_threads = new RenderingThread [m_tgtThreadCount];
+    m_curThreadCount = m_tgtThreadCount;
+    for (size_t i = 0; i < m_tgtThreadCount; ++i) {
+        size_t end = bufSize * (i + 1) / m_tgtThreadCount;
+    m_threads[i].self = this;
+        m_threads[i].threadIndex = i;
+        m_threads[i].minIndex = prevIndex;
+        m_threads[i].maxIndex = end;
+        m_threads[i].pixelsRendered = 0;
+        m_threads[i].rerenderRequestedAt = 0;
+        m_threads[i].isIdling = false;
+        sem_init(&m_threads[i].wakeupSem, 0, 0);
+        pthread_create(&m_threads[i].thread, NULL, rendererThreadEntry, (void*) &m_threads[i]);
+        prevIndex = end;
+    }
+
+    m_threadsIdling = false;
+}
+
+void RTRView::requestRerender() {
+    for (size_t i = 0; i < m_curThreadCount; ++i) {
+        RenderingThread &thread = m_threads[i];
+        thread.rerenderRequestedAt = thread.pixelsRendered;
+        if (thread.isIdling)
+            sem_post(&thread.wakeupSem);
+    }
+    m_threadsIdling = false;
+}
+
+void RTRView::pushParams() {
+    m_activeParams = m_pushedParams;
+    requestRerender();
+}
+
+void RTRView::OnSizeChanged() {
+    reset();
+}
+
+void RTRView::Redraw() const {
+    for (size_t i = 0; i < GetSize().y; ++i) {
+        for (size_t j = 0; j < GetSize().x; ++j) {
+            rgbf color = m_framebuffer[i * m_fbWidth + j];
+            targetImage->SetPixel(j, i, Color(
+                color.r() * 255,
+                color.g() * 255,
+                color.b() * 255
+            ));
+        }
+    }
+    targetImage->DrawOn(GetTexture());
+}
+
+hui::EventResult RTRView::OnIdle(hui::IdleEvent &evt) {
+    ForceRedraw();
+    return hui::EventResult::HANDLED;
+}
+
+RTRView::~RTRView() {
+    m_threadsShouldDie = true;
+    for (size_t i = 0; i < m_curThreadCount; ++i) {
+        RenderingThread &thread = m_threads[i];
+        sem_post(&thread.wakeupSem); // wake up sleeping thread
+        pthread_join(thread.thread, NULL);
+        sem_destroy(&thread.wakeupSem);
+    }
+    delete [] m_threads;
+}
+
+ray3f RTRView::rayForPixel(vec3f pixel) {
+    float sinAz = sinf(m_activeParams.cameraAzimuth),
+          cosAz = cosf(m_activeParams.cameraAzimuth),
+          sinEl = sinf(m_activeParams.cameraElevation),
+          cosEl = cosf(m_activeParams.cameraElevation);
+
+    vec3f camForward = vec3f(
+        - cosAz * cosEl,
+        - sinAz * cosEl,
+        - sinEl
+    );
+    vec3f camRight = vec3f(
+        - sinAz,
+        cosAz,
+        0
+    );
+    vec3f camUp = vec3f(
+        cosAz * sinEl,
+        sinAz * sinEl,
+        - cosEl
+    );
+
+    size_t unit = std::min(m_fbWidth, m_fbHeight) / 2;
+
+    vec3f pos = (pixel - vec3f(m_fbWidth, m_fbHeight) / 2) / unit;
+    ray3f cameraRay(
+                m_activeParams.cameraTarget - camForward * m_activeParams.cameraDistance,
+                camForward * m_activeParams.cameraPlaneDistance
+                + camUp * pos.y() 
+                + camRight * pos.x());
+    return cameraRay;
+}
+
+void RTRView::rendererThread(RenderingThread &thread) {
+
+    while (true) {
+        for (size_t j = thread.minIndex; j < thread.maxIndex; ++j) {
+            if (m_threadsShouldDie) {
+                return;
+            }
+
+            size_t i = m_indices[j];
+            size_t x = i % m_fbWidth, y = i / m_fbWidth;
+
+            rgbf color = m_scene->raytrace(rayForPixel(vec3f(x, y)));
+            m_framebuffer[i] = rgbf(color.r(), color.g(), color.b(), 1.0f);
+
+            ++thread.pixelsRendered;
+            if (thread.rerenderRequestedAt + (thread.maxIndex - thread.minIndex) <= thread.pixelsRendered) {
+                // sleep
+                thread.isIdling = true;
+                sem_wait(&thread.wakeupSem);
+                thread.isIdling = false;
+            }
+        }
+    }
+}
+
+static vec3f tv(dr4::Vec2f v) {
+    return vec3f(v.x, v.y);
+}
+
+hui::EventResult RTRView::OnMouseDown(hui::MouseButtonEvent &evt) {
+    if (!GetRect().Contains(evt.pos))
+        return hui::EventResult::UNHANDLED;
+
+    if (evt.button == dr4::MouseButtonType::LEFT) {
+        // Normal selection
+        auto maybeHit = m_scene->getRayHit(rayForPixel(tv(evt.pos - GetPos())));
+        if (!maybeHit) return hui::EventResult::HANDLED;
+
+        /*if (evt.mods & SHIFT) {
+            maybeHit->object->setSelected(true);
+        } else if (evt.mods & ALT) {
+            maybeHit->object->setSelected(false);
+        } else {*/
+            m_scene->deselectAll();
+            maybeHit->object->setSelected(true);
+        //}
+    }
+/*
+
+    } else if (evt.button == 2 && (evt.mods & CTRL)) {
+        m_mouseAction = MouseAction::MOVE;
+        m_mouseStartPos = evt.localPos;
+        m_mouseInitialVec = m_pushedParams.cameraTarget; 
+        app()->setGrabbedInput(this);
+
+    } else if (evt.button == 2) {
+        m_mouseAction = MouseAction::ROTATE;
+        m_mouseStartPos = evt.localPos;
+        m_mouseInitialVec = vec2f(-camAzimuth(), camElevation());
+        app()->setGrabbedInput(this);
+    }*/
+
+    return hui::EventResult::HANDLED;
+}
+
+hui::EventResult RTRView::OnMouseMove(hui::MouseMoveEvent &evt)  {
+
+    float maxDim = std::max(GetSize().x, GetSize().y);
+
+    if (m_mouseAction == MouseAction::ROTATE) {
+        vec3f delta = tv(evt.pos) - m_mouseStartPos;
+
+        vec3f resultVec = m_mouseInitialVec + delta / maxDim * M_PI;
+        setCamAzimuth(-resultVec.x());
+        setCamElevation(resultVec.y());
+        pushParams();
+
+    } else if (m_mouseAction == MouseAction::MOVE) {
+        float sinAz = sinf(m_activeParams.cameraAzimuth),
+              cosAz = cosf(m_activeParams.cameraAzimuth),
+              sinEl = sinf(m_activeParams.cameraElevation),
+              cosEl = cosf(m_activeParams.cameraElevation);
+
+        vec3f camRight = vec3f(
+            - sinAz,
+            cosAz,
+            0
+        );
+        vec3f camUp = vec3f(
+            cosAz * sinEl,
+            sinAz * sinEl,
+            - cosEl
+        );
+
+        vec3f delta = (tv(evt.pos) - m_mouseStartPos) / maxDim;
+        float camDist = m_activeParams.cameraDistance;
+
+        setCamTarget(m_mouseInitialVec - (camRight * delta.x() + camUp * delta.y()) * camDist);
+        pushParams();
+    }
+    return hui::EventResult::HANDLED;
+}
+
+hui::EventResult RTRView::OnMouseUp(hui::MouseButtonEvent &evt) {
+    m_mouseAction = MouseAction::NONE;
+    GetUI()->SetCaptured(nullptr);
+    return hui::EventResult::HANDLED;
+}
+
+hui::EventResult RTRView::OnMouseWheel(hui::MouseWheelEvent &evt) {
+    const float ZOOM_FACTOR = 0.9;
+    float factor = evt.delta.y > 0 ? ZOOM_FACTOR : 1 / ZOOM_FACTOR;
+    setCamDistance(camDistance() * factor);
+    pushParams();
+    return hui::EventResult::HANDLED;
+}
+
+}

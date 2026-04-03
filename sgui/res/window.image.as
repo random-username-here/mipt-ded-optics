@@ -1,0 +1,10 @@
+.type 9slice 
+.file window.png
+.ot 30
+.it 0
+.ol 11
+.il 0
+.or 11
+.ir 0
+.ob 11
+.ib 5

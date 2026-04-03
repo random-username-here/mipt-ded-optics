@@ -1,0 +1,22 @@
+Resource file format
+
+    Strings and blobs are encoded using u32 length, then data
+    Numbers are encoded as i32 or f32
+
+    Resource is encoded as follows:
+
+        str name
+        str type
+        u32 number of fields
+        repeating:
+            str field name
+            char type
+            field value
+
+    type is:
+        s for strings/blobs
+        i for ints
+        f for floats
+
+    Resource file consists of many resources.
+    It has number of resources at start (u32), then all those resources.
